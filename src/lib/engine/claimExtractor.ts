@@ -1,6 +1,10 @@
 import type { CandidateProfile, ResumeClaim } from '../types';
-import { cleanPdfText, isReadableEnglishText, stripPdfSyntax } from './pdfParser';
+import { cleanPdfText, isReadableEnglishText, mergeWrappedLines, stripPdfSyntax } from './pdfParser';
 import { ResumeKeywordExtractor } from './keywordExtractor';
+import { computeExperienceYears, structureResume } from './resumeSections';
+
+// Dictionary keys that are also everyday words; only trusted inside a Skills section
+const AMBIGUOUS_SKILL_KEYS = new Set(['go', 'lever', 'canvas', 'epic', 'indeed', 'workable', 'ats', 'adp', 'sem']);
 
 /**
  * Sanitize individual claim text to make sure it's presented in 100% clean, proper English.
@@ -37,7 +41,11 @@ export function sanitizeClaimToEnglish(text: string): string {
  */
 export function extractClaimsFromText(rawText: string, candidateName: string = ''): CandidateProfile {
   const cleanedText = cleanPdfText(rawText || '');
-  const lines = cleanedText.split('\n').map(l => l.trim()).filter(l => isReadableEnglishText(l));
+  const lines = mergeWrappedLines(cleanedText.split('\n')).filter(l => isReadableEnglishText(l));
+  const structured = structureResume(lines);
+  const hasSections = Object.keys(structured.sections).some(k => k !== 'header');
+  const contactLines = new Set(hasSections ? structured.sections.header || [] : []);
+  const skillSectionLines = new Set(structured.sections.skills || []);
 
   // 1. Detect Real Candidate Name from Resume Text (Document content is source of truth)
   let detectedName = '';
@@ -177,7 +185,6 @@ export function extractClaimsFromText(rawText: string, candidateName: string = '
     'hris': { set: databases, canonical: 'HRIS Management' },
     'ats': { set: databases, canonical: 'ATS Management' },
     'linkedin recruiter': { set: toolsAndInfra, canonical: 'LinkedIn Recruiter' },
-    'linkedin': { set: toolsAndInfra, canonical: 'LinkedIn Recruiter' },
     'naukri': { set: toolsAndInfra, canonical: 'Naukri' },
     'indeed': { set: toolsAndInfra, canonical: 'Indeed' },
 
@@ -277,10 +284,12 @@ export function extractClaimsFromText(rawText: string, candidateName: string = '
     'git': { set: toolsAndInfra, canonical: 'Git' }
   };
 
-  // Match keyword dictionary
+  // Match keyword dictionary (contact/header lines excluded so "Linkedin: ..." is not read as a skill)
   for (const line of lines) {
+    if (contactLines.has(line)) continue;
     const l = line.toLowerCase();
     for (const [key, meta] of Object.entries(skillsMap)) {
+      if (AMBIGUOUS_SKILL_KEYS.has(key) && !skillSectionLines.has(line)) continue;
       const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       if (new RegExp(`(?:^|[^a-zA-Z0-9_])${escapedKey}(?:$|[^a-zA-Z0-9_])`, 'i').test(l)) {
         meta.set.add(meta.canonical);
@@ -288,8 +297,31 @@ export function extractClaimsFromText(rawText: string, candidateName: string = '
     }
   }
 
-  // Dynamic Skill Extraction from Skills / Competencies / Expertise Sections
-  const skillSectionIndex = lines.findIndex(l => 
+  // Structured Skills section: "Label: a, b, c" lines, with the label deciding the bucket
+  const knownSkills = new Set<string>([languages, frameworks, databases, toolsAndInfra].flatMap(s => Array.from(s).map(v => v.toLowerCase())));
+  const addSkill = (set: Set<string>, value: string) => {
+    const key = value.toLowerCase();
+    if (knownSkills.has(key)) return;
+    knownSkills.add(key);
+    set.add(value);
+  };
+  for (const group of structured.skillGroups) {
+    const label = group.label.toLowerCase();
+    const labelSet =
+      /lang/.test(label) ? languages :
+      /data|db|storage/.test(label) ? databases :
+      /tool|platform|cloud|devops|infra|software|ide/.test(label) ? toolsAndInfra :
+      /framework|librar|backend|frontend|method|concept|practice|standard/.test(label) ? frameworks :
+      languages;
+    for (const item of group.items) {
+      const dictionaryMatch = skillsMap[item.toLowerCase()];
+      if (dictionaryMatch) addSkill(dictionaryMatch.set, dictionaryMatch.canonical);
+      else addSkill(labelSet, item);
+    }
+  }
+
+  // Dynamic Skill Extraction from Skills / Competencies / Expertise Sections (fallback when no structured section)
+  const skillSectionIndex = structured.skillGroups.length > 0 ? -1 : lines.findIndex(l =>
     /^(?:skills|key skills|core competencies|competencies|areas of expertise|technical skills|tools & technologies|tools & platforms)\b/i.test(l.trim())
   );
   if (skillSectionIndex !== -1 && lines.length > skillSectionIndex + 1) {
@@ -316,6 +348,10 @@ export function extractClaimsFromText(rawText: string, candidateName: string = '
   // 4. Calculate Experience Years from real dates found in resume
   let calculatedYears = 0;
   const yearMatches = Array.from(rawText.matchAll(/\b(19\d\d|20\d\d)\b/g)).map(m => parseInt(m[1], 10));
+  // "2021 - Present" means the candidate is still in the role, so count up to the current year
+  if (/\b(?:19|20)\d{2}\s*(?:-|–|—|to)\s*(?:present|current|now)\b/i.test(rawText)) {
+    yearMatches.push(new Date().getFullYear());
+  }
   const validYears = yearMatches.filter(y => y >= 1990 && y <= new Date().getFullYear());
   if (validYears.length >= 2) {
     const minYear = Math.min(...validYears);
@@ -324,25 +360,47 @@ export function extractClaimsFromText(rawText: string, candidateName: string = '
   } else if (validYears.length === 1) {
     calculatedYears = Math.max(1, new Date().getFullYear() - validYears[0]);
   }
+  // Prefer the dated roles in the Experience section, so education years are not counted as work
+  const experienceSectionYears = computeExperienceYears(structured.experience);
+  if (experienceSectionYears !== null) calculatedYears = experienceSectionYears;
 
   // 5. Extract Real Claims: Split by sentence boundaries (. , \n, •) so claims are short and concise
   const extractedClaims: ResumeClaim[] = [];
   const metricsRegex = /(\d[\d,.]*\s*[%kKmMbB\+]|\d[\d,.]*\s*(?:users|rps|tps|ms|requests|concurrent|million|billion|queries|events|tb|gb|sec|min|hrs|percent|reduction|increase|downloads|clients|interviews|profiles|applications|drives|roles|projects|candidates|positions|requisitions|loops|\$))/i;
 
-  // Split raw text into individual distinct sentences
-  const rawSentences: string[] = [];
-  for (const line of lines) {
-    const sentences = line
+  // Claim sources: each role/project's own bullets (so a claim knows where it came from), summary last.
+  // Without recognizable sections, fall back to scanning every line.
+  const SUMMARY_GROUP = Number.MAX_SAFE_INTEGER;
+  const entryGroups = [
+    ...structured.experience.map(e => ({ context: [e.role, e.organization].filter(Boolean).join(' at '), highlights: e.highlights })),
+    ...structured.projects.map(p => ({ context: `Project: ${p.name}`, highlights: p.highlights }))
+  ].filter(g => g.highlights.length > 0);
+  const claimSources: { text: string; context: string; group: number }[] = entryGroups.length > 0
+    ? [
+        ...entryGroups.flatMap((g, group) => g.highlights.map(text => ({ text, context: g.context || 'Documented Experience', group }))),
+        ...(structured.sections.summary || []).map(text => ({ text, context: 'Professional Summary', group: SUMMARY_GROUP }))
+      ]
+    : lines.map(text => ({ text, context: 'Documented Experience', group: 0 }));
+
+  // Split sources into individual distinct sentences
+  const rawSentences: { text: string; context: string; group: number }[] = [];
+  for (const source of claimSources) {
+    const sentences = source.text
       .split(/(?<=[.!?•])\s+|\s*[•\n\r\t]+\s*/g)
       .map(s => s.trim())
       .filter(s => s.length > 20);
-    rawSentences.push(...sentences);
+    rawSentences.push(...sentences.map(text => ({ ...source, text })));
   }
 
   let claimIdx = 1;
   const seenClaims = new Set<string>();
+  const actionVerbRegex = /^(?:built|architected|designed|developed|implemented|optimized|scaled|reduced|created|managed|directed|spearheaded|engineered|led|delivered|handled|improved|analyzed|coordinated|maintained|authored|resolved|established|automated|launched|sourced|screened|conducted|reviewed|partnered|recruited|initiated|tracked|deployed|migrated|configured|facilitated|cut|rolled|grew|increased|decreased|negotiated|trained|mentored|introduced|redesigned|streamlined|owned)\b/i;
+  const monthRegex = '(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\\.?';
+  const dateRangeRegex = new RegExp(`(?:${monthRegex}\\s+)?(?:19|20)\\d{2}\\s*(?:-|–|—|to)\\s*(?:present|current|now|(?:${monthRegex}\\s+)?(?:19|20)\\d{2})`, 'i');
+  // Candidates are ranked so achievement bullets win over summary/contact lines, then restored to document order
+  const rankedCandidates: { claim: ResumeClaim; score: number; order: number; group: number }[] = [];
 
-  for (const sentence of rawSentences) {
+  for (const { text: sentence, context, group } of rawSentences) {
     let sanitized = sanitizeClaimToEnglish(sentence);
     if (!sanitized || sanitized.length < 25) continue;
 
@@ -363,6 +421,15 @@ export function extractClaimsFromText(rawText: string, candidateName: string = '
 
     // Filter out pure job header lines with dates like "Aventurine Homes - Bengaluru [May 2026 - Present]"
     if (/[-–—].*\[.*\d{4}/i.test(sanitized) || /\[\w+\s+\d{4}\s*[-–—]/i.test(sanitized) || /\|\s*talent acquisition/i.test(sanitized)) continue;
+    // Filter out "Role - Company Jan 2021 - Present" / "Role - Company (2019 - Present)" header lines
+    if (dateRangeRegex.test(sanitized) && sanitized.length < 110 && !actionVerbRegex.test(sanitized)) continue;
+    // Filter out contact lines
+    if (/@|https?:\/\/|\+?\d[\d\s-]{8,}\d/.test(sanitized) && !actionVerbRegex.test(sanitized)) continue;
+    // Filter out comma-delimited skill lists ("Go, Java, Python, Kafka, ...")
+    const listParts = sanitized.replace(/\.$/, '').split(/\s*[,|]\s*/);
+    if (listParts.length >= 4 && listParts.every(p => p.split(/\s+/).length <= 3)) continue;
+    // Filter out education lines
+    if (/\b(?:bachelor|master|phd|b\.?tech|m\.?tech|b\.?e|mba|bba|bca|mca|b\.?sc|m\.?sc|b\.?com|m\.?com|diploma|degree|university|institute|college)\b/i.test(sanitized) && !actionVerbRegex.test(sanitized)) continue;
 
     // Reject if sentence contains excessive non-alphabet tokens or leftover PDF syntax
     if (/\/(?:Parent|Dest|XYZ|Title|Prev|Next|Font|stream|endobj|endstream)\b/i.test(sanitized)) continue;
@@ -372,20 +439,24 @@ export function extractClaimsFromText(rawText: string, candidateName: string = '
     const words = sanitized.split(/\s+/).filter(w => /^[a-zA-Z]{3,}/.test(w.replace(/[^a-zA-Z]/g, '')));
     if (words.length < 4) continue;
 
-    // Keep claim concise (under 140 characters max) so it can be quickly probed in an interview
-    if (sanitized.length > 140) {
-      const parts = sanitized.split(/[,;]\s+/);
-      sanitized = parts[0];
-      if (parts[1] && sanitized.length < 60) {
-        sanitized += ', ' + parts[1];
+    // Keep claims probe-able: whole bullets up to 240 chars, otherwise trim at the last clause that fits
+    if (sanitized.length > 240) {
+      const parts = sanitized.split(/(?<=[,;])\s+/);
+      let trimmed = parts[0];
+      for (const part of parts.slice(1)) {
+        if (trimmed.length + part.length + 1 > 240) break;
+        trimmed += ' ' + part;
       }
+      sanitized = trimmed.replace(/[,;]$/, '');
       if (!/[.!?]$/.test(sanitized)) sanitized += '.';
     }
 
-    const isClaimCandidate = 
-      metricsRegex.test(sanitized) || 
-      /^(?:built|architected|designed|developed|implemented|optimized|scaled|reduced|created|managed|directed|spearheaded|engineered|led|delivered|handled|improved|analyzed|coordinated|maintained|authored|resolved|established|automated|launched|sourced|screened|conducted|reviewed|partnered|recruited|initiated|tracked|deployed|migrated|configured|facilitated)\b/i.test(sanitized) ||
-      (sanitized.length >= 35 && sanitized.length <= 140 && !sanitized.includes('@') && !sanitized.includes('http'));
+    const hasMetric = metricsRegex.test(sanitized);
+    const startsWithAction = actionVerbRegex.test(sanitized);
+    const isClaimCandidate =
+      hasMetric ||
+      startsWithAction ||
+      (sanitized.length >= 35 && sanitized.length <= 240 && !sanitized.includes('@') && !sanitized.includes('http'));
 
     if (isClaimCandidate) {
       const match = sanitized.match(metricsRegex);
@@ -409,20 +480,50 @@ export function extractClaimsFromText(rawText: string, candidateName: string = '
       const lowerKey = sanitized.toLowerCase().slice(0, 40);
       if (!seenClaims.has(lowerKey)) {
         seenClaims.add(lowerKey);
-        extractedClaims.push({
-          id: `claim-${claimIdx++}`,
-          rawClaim: sanitized,
-          category,
-          contextProject: 'Documented Experience',
-          claimedMetrics: metrics,
-          confidenceLevel: sanitized.length > 40 ? 'High' : 'Needs Deep-Dive',
-          verificationStatus: 'Pending'
+        rankedCandidates.push({
+          claim: {
+            id: '',
+            rawClaim: sanitized,
+            category,
+            contextProject: context,
+            claimedMetrics: metrics,
+            confidenceLevel: sanitized.length > 40 ? 'High' : 'Needs Deep-Dive',
+            verificationStatus: 'Pending',
+            sourceText: sentence
+          },
+          score: (startsWithAction ? 2 : 0) + (hasMetric ? 2 : 0),
+          order: rankedCandidates.length,
+          group
         });
       }
-
-      if (extractedClaims.length >= 8) break;
     }
   }
+
+  // Share the 8 claim slots across roles/projects (round-robin, best-scored first within each),
+  // so one long job doesn't crowd out the rest; summary sentences only fill leftover slots
+  const MAX_CLAIMS = 8;
+  const byGroup = new Map<number, typeof rankedCandidates>();
+  for (const candidate of rankedCandidates) {
+    if (!byGroup.has(candidate.group)) byGroup.set(candidate.group, []);
+    byGroup.get(candidate.group)!.push(candidate);
+  }
+  const sortQueue = (queue: typeof rankedCandidates) => queue.sort((a, b) => b.score - a.score || a.order - b.order);
+  const groupQueues = Array.from(byGroup.entries())
+    .filter(([group]) => group !== SUMMARY_GROUP)
+    .sort((a, b) => a[0] - b[0])
+    .map(([, queue]) => sortQueue(queue));
+  const selected: typeof rankedCandidates = [];
+  while (selected.length < MAX_CLAIMS && groupQueues.some(q => q.length > 0)) {
+    for (const queue of groupQueues) {
+      if (selected.length >= MAX_CLAIMS) break;
+      const next = queue.shift();
+      if (next) selected.push(next);
+    }
+  }
+  selected.push(...sortQueue(byGroup.get(SUMMARY_GROUP) || []).slice(0, MAX_CLAIMS - selected.length));
+  selected
+    .sort((a, b) => a.order - b.order)
+    .forEach(({ claim }) => extractedClaims.push({ ...claim, id: `claim-${claimIdx++}` }));
 
   // If fewer than 2 claims extracted from bullet points, extract clean grounded claims from resume lines
   if (extractedClaims.length < 2) {
@@ -451,8 +552,8 @@ export function extractClaimsFromText(rawText: string, candidateName: string = '
   }
 
   // 6. Extract Real Summary from resume if present
-  let realSummary = '';
-  const summaryIndex = lines.findIndex(l => /^(professional summary|summary|about me|profile|overview|objective)/i.test(l));
+  let realSummary = (structured.sections.summary || []).map(l => sanitizeClaimToEnglish(l)).filter(Boolean).join(' ');
+  const summaryIndex = realSummary ? -1 : lines.findIndex(l => /^(professional summary|summary|about me|profile|overview|objective)/i.test(l));
   if (summaryIndex !== -1 && lines.length > summaryIndex + 1) {
     const summaryLines = lines.slice(summaryIndex + 1, summaryIndex + 4).filter(l => !/^(experience|education|skills|projects|work)/i.test(l));
     if (summaryLines.length > 0) {
@@ -468,8 +569,12 @@ export function extractClaimsFromText(rawText: string, candidateName: string = '
   }
 
   // 7. Extract Real Education & Institutions from resume lines
-  const educationList: CandidateProfile['education'] = [];
-  for (const line of lines) {
+  const educationList: CandidateProfile['education'] = structured.education.slice(0, 4).map(e => ({
+    degree: e.degree || e.institution,
+    institution: e.institution || 'Educational Institution',
+    year: e.year
+  }));
+  for (const line of educationList.length > 0 ? [] : lines) {
     const cleanLine = line.replace(/^[•\-\*\+\d\.\)\:\>\s|#]+/, '').trim();
     if (/^(?:provided|managed|taught|mentored|guided|conducted|coached|trained|supported|scheduled|facilitated|coordinated|partnered|sourced|screened|evaluated|reviewed|prepared|initiated|tracked|built|ensured)\b/i.test(cleanLine)) {
       continue;
@@ -497,7 +602,39 @@ export function extractClaimsFromText(rawText: string, candidateName: string = '
   // 8. Extract Real Work Experience Roles across all industries
   const projectsList: CandidateProfile['projects'] = [];
   let projIdx = 1;
-  for (let i = 0; i < lines.length; i++) {
+  // Structured roles and projects: technologies are the extracted skills each entry actually mentions
+  const allSkillNames = [languages, frameworks, databases, toolsAndInfra].flatMap(s => Array.from(s));
+  const skillsMentionedIn = (texts: string[]) => {
+    const haystack = texts.join(' ').toLowerCase();
+    return allSkillNames.filter(skill => haystack.includes(skill.toLowerCase())).slice(0, 6);
+  };
+  for (const entry of structured.experience) {
+    const highlights = entry.highlights.map(h => sanitizeClaimToEnglish(h)).filter(Boolean);
+    projectsList.push({
+      id: `proj-${projIdx++}`,
+      title: entry.organization || entry.role,
+      role: entry.role,
+      duration: entry.duration,
+      technologies: skillsMentionedIn(entry.highlights),
+      description: highlights[0] || `${entry.role} role documented on resume.`,
+      highlights
+    });
+  }
+  for (const project of structured.projects) {
+    const highlights = project.highlights.map(h => sanitizeClaimToEnglish(h)).filter(Boolean);
+    projectsList.push({
+      id: `proj-${projIdx++}`,
+      title: project.name,
+      role: 'Project',
+      duration: '',
+      technologies: skillsMentionedIn(project.highlights),
+      description: highlights[0] || `${project.name} documented on resume.`,
+      highlights
+    });
+  }
+  // Fallback: guess roles from "Role - Company (dates)" lines when no Experience/Projects section was found
+  const useLegacyRoleScan = projectsList.length === 0;
+  for (let i = 0; useLegacyRoleScan && i < lines.length; i++) {
     const line = lines[i];
     const hasRoleKeyword = titleKeywordsRegex.test(line);
     const hasSeparator = /[-–—|•:]/.test(line);

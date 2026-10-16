@@ -4,6 +4,12 @@ import crypto from 'crypto';
 import zlib from 'zlib';
 
 /**
+ * Bump whenever text extraction or profile/claim structuring changes. It is part of the
+ * resume cache key, so profiles parsed by older logic are not served after an upgrade.
+ */
+export const RESUME_PARSER_VERSION = '2026-10-16.sections';
+
+/**
  * Compute SHA-256 content hash for duplicate upload detection (SRS FR-002).
  */
 export function computeBufferSha256(buffer: Buffer): string {
@@ -230,6 +236,42 @@ export function cleanPdfText(rawText: string): string {
   return lines.join('\n').trim();
 }
 
+const WRAP_CONNECTOR_REGEX = /(?:,|&|\(|\b(?:and|or|the|a|an|of|to|for|from|with|by|in|on|at|into|across|through|via|as|while|using|including|per|than|over|under|within|between))$/i;
+
+/**
+ * Re-joins sentences and bullets that the PDF layout wrapped onto several visual lines,
+ * e.g. "Reduced latency by 45% by caching and rewriting the" + "hottest queries."
+ * A line continues the previous one when the previous line has no terminal punctuation and
+ * either the next line starts lowercase or the previous line ends on a comma/connector word.
+ */
+export function mergeWrappedLines(lines: string[]): string[] {
+  const merged: string[] = [];
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const prev = merged[merged.length - 1];
+    const startsNewItem = /^[•\-\*–—]/.test(line);
+    const prevIsHeader = prev !== undefined && prev === prev.toUpperCase() && /[A-Z]/.test(prev);
+    const prevIsOpen = prev !== undefined && !/[.!?:;]$/.test(prev);
+    // Contact and "Title | Company" header lines are not prose, so never wrap into or out of them
+    const isStructuredLine = (l: string) => /[|@]|https?:\/\/|www\./i.test(l);
+    const isContinuation =
+      prevIsOpen &&
+      !startsNewItem &&
+      !prevIsHeader &&
+      !isStructuredLine(prev) &&
+      !isStructuredLine(line) &&
+      (/^[a-z]/.test(line) || WRAP_CONNECTOR_REGEX.test(prev));
+
+    if (isContinuation) {
+      merged[merged.length - 1] = `${prev} ${line}`;
+    } else {
+      merged.push(line);
+    }
+  }
+  return merged;
+}
+
 /**
  * Layout-aware spatial PDF text extractor.
  * Reconstructs reading order for two-column resumes, sidebars, headers, and tables.
@@ -274,24 +316,46 @@ async function extractSpatialTextFromPdf(buffer: Buffer): Promise<string> {
     }
 
     const pageWidth = maxX - minX;
-    const midX = minX + pageWidth * 0.45;
 
-    // Check if there is a column split
-    let leftCount = 0;
-    let rightCount = 0;
-    let crossCount = 0;
-
-    for (const item of items) {
-      if (item.x + item.width < midX) {
-        leftCount++;
-      } else if (item.x > midX) {
-        rightCount++;
-      } else {
-        crossCount++;
+    // Detect a column split by finding a vertical gutter (an x-band almost no text crosses).
+    // Works for sidebars of any width, unlike a fixed midpoint.
+    const detectColumnSplit = (): number | null => {
+      if (pageWidth < 250 || items.length < 12) return null;
+      const bins = Math.ceil(pageWidth);
+      const coverage = new Array(bins + 1).fill(0);
+      for (const item of items) {
+        const start = Math.max(0, Math.floor(item.x - minX));
+        const end = Math.min(bins, Math.ceil(item.x + item.width - minX));
+        for (let b = start; b <= end; b++) coverage[b]++;
       }
-    }
 
-    const isTwoColumn = pageWidth > 250 && leftCount > 6 && rightCount > 6 && crossCount < (leftCount + rightCount) * 0.35;
+      // Allow a few full-width items (e.g. a name banner) to cross the gutter
+      const tolerance = Math.max(1, Math.floor(items.length * 0.03));
+      const lo = Math.floor(pageWidth * 0.2);
+      const hi = Math.ceil(pageWidth * 0.8);
+      let best: { start: number; width: number } | null = null;
+      let runStart = -1;
+      for (let b = lo; b <= hi + 1; b++) {
+        const isGap = b <= hi && coverage[b] <= tolerance;
+        if (isGap && runStart < 0) runStart = b;
+        if (!isGap && runStart >= 0) {
+          const width = b - runStart;
+          if (!best || width > best.width) best = { start: runStart, width };
+          runStart = -1;
+        }
+      }
+      if (!best || best.width < 8) return null;
+
+      const split = minX + best.start + best.width / 2;
+      const charsLeft = items.filter(i => i.x + i.width <= split).reduce((n, i) => n + i.str.length, 0);
+      const charsRight = items.filter(i => i.x >= split).reduce((n, i) => n + i.str.length, 0);
+      const totalChars = items.reduce((n, i) => n + i.str.length, 0);
+      // Both sides must hold real content, so right-aligned date stamps don't count as a column
+      if (charsLeft < totalChars * 0.1 || charsRight < totalChars * 0.1) return null;
+      return split;
+    };
+
+    const columnSplit = detectColumnSplit();
 
     const formatColumnItems = (colItems: TextItemInfo[]): string => {
       // Group items into lines by Y coordinate (within 3.5 points)
@@ -319,7 +383,20 @@ async function extractSpatialTextFromPdf(buffer: Buffer): Promise<string> {
       const formattedLines: string[] = [];
       for (const line of lines) {
         line.items.sort((a, b) => a.x - b.x);
-        const lineText = line.items.map(i => i.str.trim()).filter(Boolean).join(' ');
+        // Only insert a space where there is a visible gap, so ligature glyphs ("fi", "fl")
+        // and split text runs are glued back into whole words
+        let lineText = '';
+        let prevEnd: number | null = null;
+        for (const item of line.items) {
+          if (prevEnd !== null) {
+            const gap = item.x - prevEnd;
+            const isGlued = gap < Math.max(1, (item.height || 10) * 0.15);
+            if (!isGlued && !lineText.endsWith(' ') && !item.str.startsWith(' ')) lineText += ' ';
+          }
+          lineText += item.str;
+          prevEnd = item.x + item.width;
+        }
+        lineText = lineText.replace(/\s+/g, ' ').trim();
         if (lineText) {
           formattedLines.push(lineText);
         }
@@ -328,10 +405,10 @@ async function extractSpatialTextFromPdf(buffer: Buffer): Promise<string> {
       return formattedLines.join('\n');
     };
 
-    if (isTwoColumn) {
+    if (columnSplit !== null) {
       // Split into Left column and Right column
-      const leftItems = items.filter(i => (i.x + i.width / 2) < midX);
-      const rightItems = items.filter(i => (i.x + i.width / 2) >= midX);
+      const leftItems = items.filter(i => (i.x + i.width / 2) < columnSplit);
+      const rightItems = items.filter(i => (i.x + i.width / 2) >= columnSplit);
 
       const leftText = formatColumnItems(leftItems);
       const rightText = formatColumnItems(rightItems);
@@ -513,7 +590,7 @@ export function extractKeyPointsFromPdfText(rawText: string): string[] {
   if (!rawText) return [];
 
   const cleaned = cleanPdfText(rawText);
-  const rawLines = cleaned.split('\n').map(l => l.trim()).filter(Boolean);
+  const rawLines = mergeWrappedLines(cleaned.split('\n'));
   const keyPoints: string[] = [];
   const seen = new Set<string>();
 

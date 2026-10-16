@@ -5,7 +5,8 @@ import {
   extractTextFromDocxBuffer,
   cleanPdfText,
   extractKeyPointsFromPdfText,
-  computeBufferSha256
+  computeBufferSha256,
+  RESUME_PARSER_VERSION
 } from '@/lib/engine/pdfParser';
 import { SAMPLE_CANDIDATES } from '@/lib/data/sampleResumes';
 import { memoryStore } from '@/lib/db/client';
@@ -45,7 +46,8 @@ export async function POST(req: NextRequest) {
       if (file) {
         const arrayBuffer = await file.arrayBuffer();
         const buffer = Buffer.from(arrayBuffer);
-        fileSha256 = computeBufferSha256(buffer);
+        // Cache key includes the parser version so a parser upgrade re-parses previously seen files
+        fileSha256 = `${RESUME_PARSER_VERSION}:${computeBufferSha256(buffer)}`;
 
         // 1. FAST DUPLICATE CACHE HIT (SRS FR-002) - Instant < 10ms response
         const cachedProfile = memoryStore.getCachedResume(fileSha256);
